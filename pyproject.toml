@@ -1,0 +1,154 @@
+[project]
+name = "agent-tracing-evaluation-tool"
+version = "0.1.0"
+description = "LLM Agent Tracing & Evaluation Framework with OpenTelemetry, PostgreSQL, and LLM-as-a-Judge"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "Agent Tracing Team"}
+]
+keywords = ["agent", "tracing", "opentelemetry", "evaluation", "llm", "ai"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+dependencies = [
+    # FastAPI & ASGI
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+
+    # Pydantic v2
+    "pydantic>=2.8.0",
+    "pydantic-settings>=2.5.0",
+
+    # SQLAlchemy async with PostgreSQL
+    "sqlalchemy[asyncio]>=2.0.30",
+    "asyncpg>=0.30.0",
+    "psycopg[binary]>=3.2.0",
+
+    # Alembic for migrations
+    "alembic>=1.16.0",
+
+    # OpenTelemetry
+    "opentelemetry-api>=1.27.0",
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-proto>=1.6.0",
+
+    # HTTP client
+    "httpx>=0.28.0",
+
+    # JSON Schema validation
+    "jsonschema>=4.23.0",
+
+    # Structured logging
+    "structlog>=24.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.16.8",
+    "mypy>=2.3.1",
+    "types-jsonschema>=4.26.0",
+    "aiosqlite>=0.22.1",
+]
+
+[project.scripts]
+agent-tracing = "agent_tracing.cli:main"
+
+[build-system]
+requires = ["poetry-core>=2.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+package-mode = false
+packages = [{include = "agent_tracing", from = "src"}]
+
+# Ruff configuration
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src"]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "I",      # isort
+    "UP",     # pyupgrade
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "SIM",    # flake8-simplify
+    "TC",     # flake8-type-checking
+    "PTH",    # flake8-pathlib
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "B008",   # do not perform positional calls on indexed dataclasses
+    "TC004",  # redundant type annotation
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["agent_tracing"]
+split-on-trailing-comma = false
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+
+# MyPy configuration
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = [
+    "opentelemetry.*",
+    "structlog.*",
+]
+ignore_missing_imports = true
+
+# Alembic configuration
+[tool.alembic]
+script_location = "alembic"
+sqlalchemy.url = "postgresql+asyncpg://user:pass@localhost/agent_tracing"
+
+# Pytest configuration
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+env = [
+    "DATABASE_URL=postgresql+asyncpg://test_user:test_pass@localhost:5432/test_agent_tracing",
+]
+
+# Coverage configuration
+[tool.coverage.run]
+source = ["src/agent_tracing"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+]
