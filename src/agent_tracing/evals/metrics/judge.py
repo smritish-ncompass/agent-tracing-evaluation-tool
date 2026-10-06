@@ -23,7 +23,7 @@ class BaseLLMJudge(BaseMetric):
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self.model = model or settings.llm_model
-        self.api_key = api_key or settings.llm_api_key
+        self.api_key = settings.llm_api_key if api_key is None else api_key
         self.base_url = (base_url or settings.llm_base_url or "https://api.openai.com/v1").rstrip(
             "/"
         )

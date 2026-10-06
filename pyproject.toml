@@ -1,5 +1,5 @@
 [project]
-name = "agent-tracing-evaluation-tool"
+name = "agent_tracing_evaluation_tool"
 version = "0.1.0"
 description = "LLM Agent Tracing & Evaluation Framework with OpenTelemetry, PostgreSQL, and LLM-as-a-Judge"
 readme = "README.md"
@@ -59,6 +59,7 @@ dev = [
     "ruff>=0.16.8",
     "mypy>=2.3.1",
     "types-jsonschema>=4.26.0",
+    "types-protobuf>=6.32.0",
     "aiosqlite>=0.22.1",
 ]
 
@@ -70,7 +71,7 @@ requires = ["poetry-core>=2.0.0"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
-package-mode = false
+package-mode = true
 packages = [{include = "agent_tracing", from = "src"}]
 
 # Ruff configuration

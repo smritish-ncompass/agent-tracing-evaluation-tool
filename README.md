@@ -20,7 +20,7 @@ This project is a self-hosted FastAPI service that:
 
 ## Key Features
 
-- **OTLP HTTP ingestion** of `ExportTraceServiceRequest` payloads, converted into traces and nested spans.
+- **OTLP/HTTP ingestion** of `ExportTraceServiceRequest` payloads in **both protobuf (`application/x-protobuf`) and JSON (`application/json`) encodings**, transparently gzip-decompressed, converted into traces and nested spans. Protobuf requests receive a protobuf `ExportTraceServiceResponse`; JSON requests receive a JSON summary.
 - **PostgreSQL persistence** with JSONB attributes, events, links, resource attributes, and instrumentation-scope metadata.
 - **GenAI semantic conventions** — extracts `gen_ai.usage.prompt_tokens`, `gen_ai.usage.completion_tokens`, and `gen_ai.usage.total_tokens` (derived when only the first two are present).
 - **Deterministic metrics**: JSON Schema validation, regex match, exact match, keyword containment, tool-selection accuracy.
@@ -37,7 +37,7 @@ This project is a self-hosted FastAPI service that:
 
 ```mermaid
 flowchart LR
-    Agent["Instrumented LLM Agent"] -->|"OTLP HTTP JSON<br/>POST /v1/traces/"| API
+    Agent["Instrumented LLM Agent"] -->|"OTLP/HTTP<br/>protobuf or JSON<br/>POST /v1/traces/"| API
 
     subgraph API["FastAPI Control Plane"]
         Health["GET /health"]
@@ -47,7 +47,8 @@ flowchart LR
         EvalsTrace["POST /v1/evals/trace/{trace_id}"]
     end
 
-    TracesIn --> OTLP["OTLPService"]
+    TracesIn --> Decode["Decode<br/>protobuf / JSON"]
+    Decode --> OTLP["OTLPService"]
     OTLP --> Repo["TraceRepository"]
     TracesList --> Repo
     Repo --> PG[("PostgreSQL<br/>traces + spans JSONB")]
@@ -71,7 +72,7 @@ flowchart LR
 | Layer | Package | Responsibility |
 |---|---|---|
 | Control plane | `agent_tracing.main` | FastAPI app, CORS, lifespan (create tables, dispose engine) |
-| Collector | `agent_tracing.collector` | OTLP Pydantic models, ingestion service, `/v1/traces` router |
+| Collector | `agent_tracing.collector` | OTLP Pydantic models, protobuf decoder, ingestion service, `/v1/traces` router |
 | Storage | `agent_tracing.storage` | SQLAlchemy ORM, Pydantic create/read schemas, async repository |
 | Evals | `agent_tracing.evals` | Metric interface, deterministic + judge metrics, runner, `/v1/evals` router |
 | Config / DB | `agent_tracing.config`, `agent_tracing.database` | Pydantic Settings, async engine and session factory |
@@ -90,10 +91,10 @@ flowchart LR
 | HTTP client | httpx (LLM judge calls) |
 | Schema checks | jsonschema |
 | Logging (declared) | structlog is a runtime dependency; no application code currently uses it |
-| OpenTelemetry (declared) | `opentelemetry-api`, `opentelemetry-sdk`, `opentelemetry-proto` are listed in `pyproject.toml`; the collector implements OTLP **message shapes in Pydantic**, not the OTel SDK exporter/processor pipeline |
-| Tests | pytest, pytest-asyncio (`asyncio_mode = auto`), pytest-cov, aiosqlite |
-| Lint / types | Ruff (line length 100), mypy (`strict = true`) |
-| Packaging | Poetry (`package-mode = false`, `src/` layout) |
+| OpenTelemetry | `opentelemetry-proto` provides the generated protobuf stubs used to decode/encode OTLP/HTTP bodies; `opentelemetry-api` / `opentelemetry-sdk` are declared but the collector implements OTLP **message shapes in Pydantic**, not the OTel SDK exporter/processor pipeline |
+| Tests | pytest, pytest-asyncio (`asyncio_mode = auto`), pytest-cov, aiosqlite, `httpx.ASGITransport` (router-level HTTP tests for both encodings) |
+| Lint / types | Ruff (line length 100), mypy (`strict = true`), `types-protobuf` / `types-jsonschema` stubs |
+| Packaging | Poetry (`package-mode = true`, `src/` layout) |
 
 ---
 
@@ -109,8 +110,9 @@ agent-tracing-evaluation-tool/
 │   ├── database.py              # async engine, session, Base, get_db_session
 │   ├── collector/
 │   │   ├── models.py            # OTLP Pydantic messages (AnyValue … ExportTraceServiceRequest)
+│   │   ├── protobuf.py          # OTLP protobuf bytes → Pydantic models (opentelemetry-proto stubs)
 │   │   ├── service.py           # OTLP → TraceCreate / SpanCreate
-│   │   └── router.py            # POST/GET /v1/traces/
+│   │   └── router.py            # POST/GET /v1/traces/ (content-type + gzip handling)
 │   ├── storage/
 │   │   ├── models.py            # Trace, Span ORM
 │   │   ├── schemas.py           # SpanCreate, TraceCreate, SpanRead, TraceRead
@@ -132,6 +134,7 @@ agent-tracing-evaluation-tool/
 │   ├── script.py.mako
 │   └── versions/0001_initial.py # traces + spans tables
 ├── alembic.ini
+├── otel-collector-config.yaml   # optional OTel Collector sidecar that forwards to this service
 ├── pyproject.toml
 └── CLAUDE.md
 ```
@@ -149,14 +152,27 @@ On FastAPI lifespan start, `Base.metadata.create_all` is run against the configu
 ### 2. Trace ingestion
 
 ```
-Agent  →  POST /v1/traces/  →  OTLPService.ingest()
-       →  for each ResourceSpans × ScopeSpans:
-              build TraceCreate + SpanCreate[]
-              extract gen_ai.usage.* token ints
-              compute duration_ms from unix-nano timestamps
+Agent  →  POST /v1/traces/   (Content-Type: application/x-protobuf | application/json,
+                              optional Content-Encoding: gzip)
+       →  read raw bytes; gzip-decompress if requested
+       →  decode by content type:
+              protobuf → decode_export_trace_request()  → ExportTraceServiceRequest
+              JSON     → ExportTraceServiceRequest.model_validate_json()
+       →  OTLPService.ingest()
+              for each ResourceSpans × ScopeSpans:
+                  build TraceCreate + SpanCreate[]
+                  extract gen_ai.usage.* token ints
+                  compute duration_ms from unix-nano timestamps
        →  TraceRepository.create_trace()  (flush + refresh)
-       →  { received, trace_ids, status: "accepted" }
+       →  protobuf request: empty ExportTraceServiceResponse (protobuf body)
+          JSON request:     { received, trace_ids, status: "accepted" }
 ```
+
+The router reads the body as **raw bytes** so binary protobuf is never coerced into JSON. Both encodings converge on the same Pydantic `ExportTraceServiceRequest`, so the storage path is shared.
+
+- **Content-Type dispatch**: `application/x-protobuf` → protobuf decoder; `application/json` (or a missing content type) → JSON; anything else → `415 Unsupported Media Type`.
+- **Content-Encoding**: `gzip` is transparently decompressed; `identity`/absent is passed through; any other encoding → `415`.
+- **Malformed input**: invalid protobuf or JSON returns a safe JSON `400` that does **not** echo the raw (possibly binary) body; a decode/storage failure after parsing returns `500`.
 
 Span IDs accept bytes, hex strings, or ints (normalized to hex). Duplicate attribute keys are collapsed into lists. Events are keyed by event name; links are keyed by `span_id`. Spans missing `trace_id` or `span_id`, and scope-span groups with no spans, are skipped.
 
@@ -321,6 +337,45 @@ Example response:
 
 `total_tokens` is stored as `20` because the collector derives it when prompt and completion counts are both present.
 
+### Ingest an OTLP protobuf trace
+
+Standard OTLP/HTTP exporters send `application/x-protobuf`. Point one at the endpoint directly, or send raw bytes:
+
+```bash
+curl -X POST http://localhost:8080/v1/traces/ \
+  -H "Content-Type: application/x-protobuf" \
+  --data-binary @trace.bin
+```
+
+The response is an empty protobuf `ExportTraceServiceResponse` (HTTP 200). A gzip-compressed body is accepted too:
+
+```bash
+curl -X POST http://localhost:8080/v1/traces/ \
+  -H "Content-Type: application/x-protobuf" \
+  -H "Content-Encoding: gzip" \
+  --data-binary @trace.bin.gz
+```
+
+If you already run an OpenTelemetry Collector, `otel-collector-config.yaml` forwards OTLP/HTTP (port 4318) into this service on port 8080:
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+exporters:
+  otlphttp:
+    endpoint: http://host.docker.internal:8080
+    tls:
+      insecure: true
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [otlphttp]
+```
+
 ### List traces
 
 ```bash
@@ -428,7 +483,7 @@ Base URL defaults to `http://localhost:8080`. CORS is configured with `allow_ori
 | Method | Path | Request | Success | Notes |
 |---|---|---|---|---|
 | `GET` | `/health` | — | `200` `{"status":"ok","service":"agent-tracing-evaluation-tool"}` | Liveness only; does not check the database |
-| `POST` | `/v1/traces/` | `ExportTraceServiceRequest` JSON body | `200` `{received, trace_ids, status}` | Failures become `500` with `Failed to ingest traces: …` |
+| `POST` | `/v1/traces/` | OTLP `ExportTraceServiceRequest` as protobuf or JSON | JSON: `200` `{received, trace_ids, status}` · protobuf: `200` empty `ExportTraceServiceResponse` | `415` unknown content type/encoding; `400` malformed body (safe JSON error); `500` on ingest failure (`Failed to ingest traces: …`) |
 | `GET` | `/v1/traces/` | `limit=100`, `offset=0` | `200` `{total, limit, offset, traces[]}` | Ordered by `created_at` descending |
 | `POST` | `/v1/evals/run` | `TestSuiteRunRequest` | `200` `TestSuiteReport` | Invalid metric config → `400` |
 | `POST` | `/v1/evals/trace/{trace_id}` | `TraceEvalRequest` | `200` `TestCaseResult` | Unknown id → `404`; bad metric config → `400` |
@@ -441,7 +496,7 @@ Each span: `trace_id`, `span_id`, `parent_span_id`, `name`, `kind`, `start_time_
 
 `AnyValue` variants: `string_value`, `bool_value`, `int_value`, `double_value`, `array_value`, `kvlist_value`, `bytes_value`. Extra keys are forbidden (`extra="forbid"`).
 
-The router docstring claims protobuf (`application/x-protobuf`) support. The handler is `request: ExportTraceServiceRequest = Body(...)`, so FastAPI parses **JSON**. There is no protobuf decoder in the collector.
+**Encoding:** the handler reads the raw request body and dispatches on `Content-Type`. Protobuf bodies are decoded with the generated `opentelemetry-proto` stubs (`agent_tracing.collector.protobuf.decode_export_trace_request`) and converted field-by-field into the same Pydantic models used for JSON, including `AnyValue` variants (`string_value`, `bool_value`, `int_value`, `double_value`, `array_value`, `kvlist_value`, `bytes_value`) and hex-encoded trace/span IDs.
 
 ### Metric configuration objects (`metrics[]`)
 
@@ -551,13 +606,15 @@ poetry run mypy src/
 
 Covered today:
 
-- Collector: ingest returns trace IDs; retrieve by `trace_id`; token attributes with null `AnyValue` stay `None`.
+- Collector service: ingest returns trace IDs; retrieve by `trace_id`; token attributes with null `AnyValue` stay `None`.
+- Collector protobuf: round-trip decode of a serialized `ExportTraceServiceRequest` into the Pydantic model.
+- Ingest endpoint (router-level via `httpx.ASGITransport`): accepts protobuf (asserts a valid protobuf `ExportTraceServiceResponse` **and** persistence of the decoded span), accepts gzip-compressed protobuf, accepts OTLP JSON, and rejects malformed protobuf with a JSON `400` that never echoes the binary body.
 - Deterministic metrics: valid/invalid JSON, schema violations, regex hit/miss/invalid pattern, exact match (case, whitespace, missing expected), contains (`all`/`any`/case/missing), tool selection (name, partial args, exact-args mismatch).
 - Judges: missing API key; mocked success for hallucination, goal adherence, tone, custom rubric.
 - `instantiate_metric` for every known type plus unknown-type `ValueError`.
 - `EvalRunner`: single case, full suite, mixed pass/fail, trace reconstruction, `max_workers=1`.
 
-There are no HTTP-level FastAPI tests (no `TestClient` / `httpx.ASGITransport` coverage of the routers).
+The eval routers are still untested at the HTTP layer; only the OTLP ingest router has `httpx.ASGITransport` coverage.
 
 ---
 
@@ -567,16 +624,15 @@ This service is an **OTLP receiver**, not an auto-instrumented application.
 
 **What exists**
 
-- Ingestion of OTLP JSON `ExportTraceServiceRequest`.
+- Ingestion of OTLP/HTTP `ExportTraceServiceRequest` in **protobuf and JSON** (gzip optional), returning the encoding-appropriate success response.
 - Persistence of resource attributes, span attributes/events/links, status, kind, timestamps, duration, scope name/version/attributes.
 - Extraction of GenAI usage counters into first-class columns.
 - Trace-eval reconstruction from `gen_ai.prompt`, `gen_ai.completion`, `gen_ai.context`.
 
 **What does not exist**
 
-- No OpenTelemetry SDK `TracerProvider`, span processor, or OTLP exporter is configured in application code (the OTel packages are declared but unused).
-- No metrics or logs pipelines.
-- No protobuf OTLP decoder despite the router description.
+- No OpenTelemetry SDK `TracerProvider`, span processor, or OTLP exporter is configured in application code (this service **receives** OTLP via the proto stubs; the `opentelemetry-api`/`opentelemetry-sdk` packages are declared but unused).
+- No metrics or logs pipelines (traces only).
 - `/health` does not probe PostgreSQL or the LLM API.
 - `structlog` is not wired into the app.
 
@@ -593,7 +649,7 @@ This service is an **OTLP receiver**, not an auto-instrumented application.
 | `gen_ai.completion` | Model/agent output — used by trace eval |
 | `gen_ai.context` | Retrieved/reference text — used by hallucination judge |
 
-Point an OTLP HTTP exporter at `http://<host>:<port>/v1/traces/` with JSON encoding. The path is `/v1/traces/` (trailing slash), not the collector-default `/v1/traces`.
+Point an OTLP HTTP exporter at `http://<host>:<port>/v1/traces/` with **either** JSON or protobuf encoding. The path is `/v1/traces/` (trailing slash), not the collector-default `/v1/traces`. A stock OTel Collector can sit in front and forward here using `otel-collector-config.yaml`.
 
 ---
 
@@ -636,7 +692,7 @@ ORM JSON columns use `JSON().with_variant(JSONB, "postgresql")`, so SQLite tests
 
 | Decision | Rationale | Cost |
 |---|---|---|
-| Pydantic OTLP models instead of generated protobuf stubs | JSON ingestion is simple to test and validate (`extra="forbid"`) | Router advertises protobuf that is not implemented; `opentelemetry-proto` is unused |
+| Pydantic OTLP models as the internal representation, with a thin protobuf decoder in front | One validated, `extra="forbid"` model drives storage regardless of wire encoding; JSON stays simple to test | A hand-written field-by-field protobuf converter must be kept in sync with the proto definitions |
 | JSONB for attributes/events/links | Agent spans are schema-flexible | Weaker relational querying; events keyed by name overwrite duplicates |
 | Token fields denormalized onto `spans` | Cheap aggregation without JSON path queries | Only `gen_ai.usage.*` ints are extracted |
 | `create_all` on startup **and** Alembic | Faster local start | Two sources of truth for schema |
@@ -667,21 +723,20 @@ This is a **beta control-plane for trusted networks**, not a hardened multi-tena
 
 ## Limitations
 
-- Protobuf OTLP is documented on the ingest route but not implemented.
-- No `GET /v1/traces/{trace_id}`, no span-level query API, no delete API.
+- No `GET /v1/traces/{trace_id}`, no span-level query API, no delete API (`TraceRepository.get_trace_by_id` / `get_trace_by_pk` / `delete_trace` exist but are not exposed).
 - Re-ingest of an existing `trace_id` is not an upsert (unique constraint).
 - Duplicate span events with the same name overwrite each other.
-- OpenTelemetry SDK packages are unused; the process does not emit its own traces.
+- `opentelemetry-api` / `opentelemetry-sdk` are unused; the process does not emit its own traces (only `opentelemetry-proto` stubs are exercised).
 - `structlog` is unused; exceptions in ingest are converted to HTTP 500 without structured logs.
 - CLI script entry point is declared but missing (`agent_tracing.cli`).
 - `poetry run uvicorn src.main:app --reload` (CLAUDE.md) does not match the real module path `agent_tracing.main:app`.
-- No Docker, compose, or CI configuration.
+- No Docker, compose, or CI configuration (an `otel-collector-config.yaml` sidecar config is provided, but no Compose file to run it).
 - No LICENSE file, despite MIT in `pyproject.toml`.
 - Judge metrics require an OpenAI-compatible JSON-mode endpoint; they fail closed without `LLM_API_KEY`.
 - Trace evaluation only understands the three `gen_ai.*` string attributes listed above (plus crude name/status fallbacks).
 - `ContainsMetric` in `all` mode can report `passed=False` with a fractional score; suite pass/fail uses `passed`, not the score.
 - FastAPI routers are untested at the HTTP layer.
-- `package-mode = false` — this is an application, not a published library, even though `[project.scripts]` is declared.
+- `package-mode = true` (packaged as an installable project), yet `agent_tracing.cli:main` is declared in `[project.scripts]` without a `cli.py` — installing the package exposes a broken console script.
 
 ---
 
@@ -689,15 +744,16 @@ This is a **beta control-plane for trusted networks**, not a hardened multi-tena
 
 The following are **not implemented**; they follow directly from gaps in the current code:
 
-- OTLP/protobuf (`application/x-protobuf`) decoder aligned with the route description.
+- Decode/emit OTLP **partial success** (`ExportTraceServiceResponse.partial_success`) so rejected spans are reported to the client instead of silently skipped.
+- Support additional `Content-Encoding` values (e.g. `deflate`) beyond `gzip`.
 - Implement or remove `agent_tracing.cli:main`.
 - Authenticated ingest/eval (API keys or mTLS).
 - Restrict CORS; make origins configurable.
 - `GET /v1/traces/{trace_id}` and delete endpoints using existing repository methods.
 - Upsert or append-spans behavior for duplicate `trace_id`s.
 - Wire `structlog` and emit the service’s own OTel traces.
-- Dockerfile / compose (API + Postgres) and a CI workflow running `pytest`, `ruff`, `mypy`.
-- HTTP-level API tests.
+- Dockerfile / compose (API + Postgres, optionally the OTel Collector) and a CI workflow running `pytest`, `ruff`, `mypy`.
+- HTTP-level tests for the eval routers.
 - Retry/backoff and circuit breaking around judge calls.
 - Persist `TestSuiteReport` alongside traces.
 - Health check that pings PostgreSQL (and optionally the LLM base URL).

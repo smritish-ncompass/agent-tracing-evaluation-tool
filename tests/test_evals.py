@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
+from agent_tracing.config import settings
 from agent_tracing.evals.metrics.deterministic import (
     ContainsMetric,
     ExactMatchMetric,
@@ -321,9 +322,13 @@ async def test_tool_selection_metric_arguments_exact_mismatch():
 
 
 @pytest.mark.asyncio
-async def test_hallucination_metric_no_api_key():
+async def test_hallucination_metric_no_api_key(monkeypatch):
     """Test HallucinationMetric with missing API key."""
-    metric = HallucinationMetric(api_key=None)
+    # Explicitly remove the API key from the application settings so this
+    # test remains independent of the developer's .env file.
+    monkeypatch.setattr(settings, "llm_api_key", None)
+
+    metric = HallucinationMetric()
 
     result = await metric.evaluate(
         input_data="user query",
@@ -333,7 +338,7 @@ async def test_hallucination_metric_no_api_key():
 
     assert result.passed is False
     assert result.score == 0.0
-    assert "not configured" in result.reasoning
+    assert "not configured" in result.reasoning.lower()
 
 
 @pytest.mark.asyncio
